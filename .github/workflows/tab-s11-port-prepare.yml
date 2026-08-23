@@ -1,0 +1,259 @@
+name: Tab S11 - Prepare Root My Galaxy port
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Samsung model
+        required: true
+        default: SM-X730
+        type: string
+      region:
+        description: Samsung CSC/region used by FUS (change to the target firmware region)
+        required: true
+        default: EUX
+        type: string
+      firmware_version:
+        description: Exact 3/4-part FUS version. Leave blank to select by build hint.
+        required: false
+        default: ""
+        type: string
+      build_hint:
+        description: AP/build substring to select when firmware_version is blank
+        required: false
+        default: BZG3
+        type: string
+      keep_vmlinux:
+        description: Include recovered vmlinux.elf in the downloadable artifact
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tab-s11-port-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    env:
+      MODEL: ${{ inputs.model }}
+      REGION: ${{ inputs.region }}
+      REQUESTED_VERSION: ${{ inputs.firmware_version }}
+      BUILD_HINT: ${{ inputs.build_hint }}
+      WORK: ${{ github.workspace }}/tab-s11-work
+
+    steps:
+      - name: Checkout controller branch
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+          docker system prune -af || true
+          df -h
+
+      - name: Install analysis dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bpftool bsdextrautils curl dwarves jq libarchive-tools lz4 \
+            llvm p7zip-full perl python3-pip unzip xz-utils zstd
+          python3 -m pip install --break-system-packages vmlinux-to-elf lz4
+          cargo install samloader --locked
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Check FUS and resolve exact firmware
+        id: firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK/fus" "$WORK/packages" "$WORK/unpack" "$WORK/out"
+
+          samloader check-update --model "$MODEL" --region "$REGION" --all \
+            | tee "$WORK/fus/available_versions.txt"
+
+          python3 - <<'PY'
+          import os, re, pathlib
+          requested = os.environ.get('REQUESTED_VERSION', '').strip()
+          hint = os.environ.get('BUILD_HINT', '').strip().upper()
+          text = pathlib.Path(os.environ['WORK'] + '/fus/available_versions.txt').read_text(errors='replace')
+          versions = re.findall(r'([A-Z0-9]+/[A-Z0-9]+/[A-Z0-9]+(?:/[A-Z0-9]+)?)', text.upper())
+          versions = list(dict.fromkeys(versions))
+          if requested:
+              selected = requested
+          elif hint:
+              matches = [v for v in versions if hint in v]
+              if not matches:
+                  raise SystemExit(f'No FUS version containing build hint {hint!r}. Available parsed versions: {versions}')
+              selected = matches[0]
+          elif versions:
+              selected = versions[0]
+          else:
+              raise SystemExit('Could not parse any firmware version from samloader output')
+          pathlib.Path(os.environ['WORK'] + '/fus/selected_version.txt').write_text(selected + '\n')
+          print(selected)
+          PY
+
+          VERSION="$(cat "$WORK/fus/selected_version.txt")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "### Firmware" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Model: \`$MODEL\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Region: \`$REGION\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Selected FUS version: \`$VERSION\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download exact Samsung firmware from FUS
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.firmware.outputs.version }}"
+          samloader download \
+            --model "$MODEL" \
+            --region "$REGION" \
+            --version "$VERSION" \
+            --threads 16 \
+            --out-file "$WORK/firmware.zip"
+          ls -lh "$WORK/firmware.zip"
+          sha256sum "$WORK/firmware.zip" | tee "$WORK/fus/firmware_zip.sha256"
+
+      - name: Extract AP/BL and raw kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -j "$WORK/firmware.zip" 'AP_*' 'BL_*' -d "$WORK/packages"
+          ls -lh "$WORK/packages"
+
+          AP="$(find "$WORK/packages" -maxdepth 1 -type f -name 'AP_*' | head -n1)"
+          test -n "$AP"
+          echo "AP=$AP"
+          bsdtar -xf "$AP" -C "$WORK/unpack" boot.img.lz4
+          lz4 -d -f "$WORK/unpack/boot.img.lz4" "$WORK/unpack/boot.img"
+
+          python3 - <<'PY'
+          import os, struct
+          from pathlib import Path
+          boot = Path(os.environ['WORK'] + '/unpack/boot.img').read_bytes()
+          if boot[:8] != b'ANDROID!':
+              raise SystemExit(f'Unexpected boot magic: {boot[:8]!r}')
+          if len(boot) < 0x1000:
+              raise SystemExit('boot.img is too small')
+          kernel_size = struct.unpack_from('<I', boot, 0x08)[0]
+          if kernel_size <= 0 or 0x1000 + kernel_size > len(boot):
+              raise SystemExit(f'Invalid kernel_size={kernel_size} for boot length {len(boot)}')
+          kernel = boot[0x1000:0x1000 + kernel_size]
+          out = Path(os.environ['WORK'] + '/out/kernel')
+          out.write_bytes(kernel)
+          print(f'kernel_size={kernel_size}')
+          PY
+
+          file "$WORK/out/kernel" || true
+          sha256sum "$WORK/out/kernel" | tee "$WORK/out/kernel.sha256"
+          ls -lh "$WORK/out/kernel"
+
+      - name: Recover symbolized vmlinux
+        shell: bash
+        run: |
+          set -euo pipefail
+          vmlinux-to-elf "$WORK/out/kernel" "$WORK/out/vmlinux.elf"
+          llvm-nm --numeric-sort "$WORK/out/vmlinux.elf" > "$WORK/out/vmlinux.nm"
+          readelf -h "$WORK/out/vmlinux.elf" > "$WORK/out/vmlinux-readelf.txt"
+          ls -lh "$WORK/out/vmlinux.elf" "$WORK/out/vmlinux.nm"
+
+      - name: Analyze kernel and extract BTF
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/tab-s11-port/analyze_kernel.py \
+            --kernel "$WORK/out/kernel" \
+            --elf "$WORK/out/vmlinux.elf" \
+            --out "$WORK/out" \
+            --model "$MODEL" \
+            --region "$REGION" \
+            --firmware "${{ steps.firmware.outputs.version }}"
+
+          if [ -s "$WORK/out/vmlinux.btf" ]; then
+            bpftool btf dump file "$WORK/out/vmlinux.btf" format raw > "$WORK/out/vmlinux-btf.raw"
+            bpftool btf dump file "$WORK/out/vmlinux.btf" format c > "$WORK/out/vmlinux-btf.h"
+          fi
+
+          llvm-objdump -d --disassemble-symbols=worker_thread "$WORK/out/vmlinux.elf" \
+            > "$WORK/out/worker_thread.objdump" 2>&1 || true
+          llvm-nm --numeric-sort "$WORK/out/vmlinux.elf" \
+            | grep -E '(__event_sched_blocked_reason|__start_ftrace_events| worker_thread$| nfulnl_logger$| sysctl_bootid$| ashmem_misc$)' \
+            > "$WORK/out/key-symbols.txt" || true
+
+          cat "$WORK/out/PORT_REPORT.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Inspect bootloader evidence for physical load address
+        shell: bash
+        run: |
+          set -euo pipefail
+          BL="$(find "$WORK/packages" -maxdepth 1 -type f -name 'BL_*' | head -n1 || true)"
+          if [ -z "$BL" ]; then
+            echo 'No BL package found' | tee "$WORK/out/bootloader-notes.txt"
+            exit 0
+          fi
+
+          bsdtar -tf "$BL" > "$WORK/out/bl-file-list.txt"
+          ENTRY="$(grep -E '(^|/)(sboot\.bin|abl\.elf)\.lz4$' "$WORK/out/bl-file-list.txt" | head -n1 || true)"
+          if [ -z "$ENTRY" ]; then
+            echo 'No sboot.bin.lz4 or abl.elf.lz4 entry found' | tee "$WORK/out/bootloader-notes.txt"
+            exit 0
+          fi
+
+          bsdtar -xf "$BL" -C "$WORK/unpack" "$ENTRY"
+          LOADER="$WORK/unpack/$ENTRY"
+          RAW="$WORK/out/bootloader.bin"
+          mkdir -p "$(dirname "$LOADER")"
+          lz4 -d -f "$LOADER" "$RAW"
+          sha256sum "$RAW" > "$WORK/out/bootloader.sha256"
+          strings -a -t x "$RAW" \
+            | grep -Ei 'Starting kernel|booting linux|kernel' \
+            | head -n 200 > "$WORK/out/bootloader-kernel-strings.txt" || true
+          echo "Bootloader entry: $ENTRY" > "$WORK/out/bootloader-notes.txt"
+          echo 'The workflow captures evidence only; do not copy a physical load address from another device.' >> "$WORK/out/bootloader-notes.txt"
+
+      - name: Add source and provenance metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/BuSung-dev/Root-My-Galaxy-Payloads.git "$WORK/Root-My-Galaxy-Payloads"
+          git -C "$WORK/Root-My-Galaxy-Payloads" rev-parse HEAD > "$WORK/out/payloads-upstream-commit.txt"
+          cp "$WORK/fus/available_versions.txt" "$WORK/out/"
+          cp "$WORK/fus/selected_version.txt" "$WORK/out/"
+          cp "$WORK/fus/firmware_zip.sha256" "$WORK/out/"
+
+          {
+            echo "model=$MODEL"
+            echo "region=$REGION"
+            echo "firmware=${{ steps.firmware.outputs.version }}"
+            echo "runner=$(uname -a)"
+            echo "generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$WORK/out/provenance.txt"
+
+      - name: Remove huge firmware packages before artifact upload
+        shell: bash
+        run: |
+          rm -f "$WORK/firmware.zip"
+          rm -rf "$WORK/packages" "$WORK/unpack"
+          if [ "${{ inputs.keep_vmlinux }}" != "true" ]; then
+            rm -f "$WORK/out/vmlinux.elf"
+          fi
+          du -h -d 1 "$WORK/out" | sort -h
+          df -h
+
+      - name: Upload Tab S11 port bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: tab-s11-${{ inputs.model }}-${{ inputs.build_hint }}-port-bundle
+          path: ${{ env.WORK }}/out/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 9

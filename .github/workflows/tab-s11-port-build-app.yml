@@ -1,0 +1,117 @@
+name: Tab S11 - Build Root My Galaxy test APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload_owner:
+        description: GitHub owner hosting the test support feed/artifacts
+        required: true
+        default: Rezoss-Reza
+        type: string
+      payload_repo:
+        description: GitHub repository hosting the test support feed/artifacts
+        required: true
+        default: s23-ksu-next
+        type: string
+      payload_ref:
+        description: Mutable branch whose support feed/artifact URLs are written into the test APK
+        required: true
+        default: chatgpt/tab-s11-port-actions
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      PAYLOAD_OWNER: ${{ inputs.payload_owner }}
+      PAYLOAD_REPO: ${{ inputs.payload_repo }}
+      PAYLOAD_REF: ${{ inputs.payload_ref }}
+
+    steps:
+      - name: Checkout controller repo
+        uses: actions/checkout@v4
+
+      - name: Clone Root My Galaxy app
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/BuSung-dev/Root-My-Galaxy.git Root-My-Galaxy
+          git -C Root-My-Galaxy rev-parse HEAD | tee app-upstream-commit.txt
+
+      - name: Point test APK at selected payload repository/ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE='Root-My-Galaxy/app/src/main/java/dev/busung/s25uroot/PayloadRepository.kt'
+          python3 - <<'PY'
+          import os, pathlib, re
+          p = pathlib.Path('Root-My-Galaxy/app/src/main/java/dev/busung/s25uroot/PayloadRepository.kt')
+          s = p.read_text()
+          owner = os.environ['PAYLOAD_OWNER']
+          repo = os.environ['PAYLOAD_REPO']
+          ref = os.environ['PAYLOAD_REF']
+          commit_api = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{ref}'
+          raw_repo = f'https://raw.githubusercontent.com/{owner}/{repo}'
+          mutable_prefix = f'$RAW_REPOSITORY/{ref}/'
+          s, n1 = re.subn(r'private const val COMMIT_API_URL =\s*\n\s*"[^"]+"',
+                         'private const val COMMIT_API_URL =\n            "' + commit_api + '"', s)
+          s, n2 = re.subn(r'private const val RAW_REPOSITORY =\s*\n\s*"[^"]+"',
+                         'private const val RAW_REPOSITORY =\n            "' + raw_repo + '"', s)
+          s, n3 = re.subn(r'private const val MUTABLE_RAW_PREFIX = "[^"]+"',
+                         'private const val MUTABLE_RAW_PREFIX = "' + mutable_prefix + '"', s)
+          if (n1, n2, n3) != (1, 1, 1):
+              raise SystemExit(f'Unexpected replacement counts: {(n1, n2, n3)}')
+          p.write_text(s)
+          PY
+          grep -A6 'COMMIT_API_URL' "$FILE"
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK/NDK requirements
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platforms;android-37' 'cmake;3.22.1' 'ndk;29.0.14206865'
+
+      - name: Build debug APK
+        shell: bash
+        working-directory: Root-My-Galaxy
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:assembleDebug
+
+      - name: Collect APK and provenance
+        shell: bash
+        run: |
+          mkdir -p apk-output
+          cp Root-My-Galaxy/app/build/outputs/apk/debug/app-debug.apk apk-output/Root-My-Galaxy-Tab-S11-test.apk
+          cp app-upstream-commit.txt apk-output/
+          {
+            echo "payload_owner=$PAYLOAD_OWNER"
+            echo "payload_repo=$PAYLOAD_REPO"
+            echo "payload_ref=$PAYLOAD_REF"
+            echo "built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > apk-output/feed-provenance.txt
+          sha256sum apk-output/Root-My-Galaxy-Tab-S11-test.apk | tee apk-output/SHA256SUMS
+          ls -lh apk-output
+
+      - name: Upload test APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Root-My-Galaxy-Tab-S11-test-apk
+          path: apk-output/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 9

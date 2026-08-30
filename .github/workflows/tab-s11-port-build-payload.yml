@@ -1,0 +1,86 @@
+name: Tab S11 - Build Root My Galaxy payload
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_id:
+        description: Target directory name under tools/tab-s11-port/target
+        required: true
+        default: gts11wifi-X730-BZG3
+        type: string
+      ndk_version:
+        description: Android NDK version
+        required: true
+        default: 29.0.14206865
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      TARGET_ID: ${{ inputs.target_id }}
+      NDK_VERSION: ${{ inputs.ndk_version }}
+
+    steps:
+      - name: Checkout controller repo
+        uses: actions/checkout@v4
+
+      - name: Validate generated target files
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET_DIR="tools/tab-s11-port/target/$TARGET_ID"
+          test -s "$TARGET_DIR/target.h"
+          test -s "$TARGET_DIR/p0_fingerprint.h"
+          if grep -RniE 'TODO|REPLACE_ME|0xDEADBEEF' "$TARGET_DIR"; then
+            echo 'Target still contains placeholders.' >&2
+            exit 1
+          fi
+
+      - name: Install Android toolchain
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "ndk;$NDK_VERSION"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Clone Root My Galaxy payload source
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/BuSung-dev/Root-My-Galaxy-Payloads.git payloads
+          mkdir -p "payloads/src/targets/$TARGET_ID"
+          cp "tools/tab-s11-port/target/$TARGET_ID/target.h" "payloads/src/targets/$TARGET_ID/target.h"
+          cp "tools/tab-s11-port/target/$TARGET_ID/p0_fingerprint.h" "payloads/src/targets/$TARGET_ID/p0_fingerprint.h"
+          git -C payloads rev-parse HEAD | tee payloads-upstream-commit.txt
+
+      - name: Build app-domain exploit payload
+        shell: bash
+        working-directory: payloads
+        run: |
+          set -euo pipefail
+          make TARGET="$TARGET_ID" ANDROID_NDK_HOME="$ANDROID_NDK_HOME" release
+          make TARGET="$TARGET_ID" ANDROID_NDK_HOME="$ANDROID_NDK_HOME" all
+          mkdir -p ../payload-output
+          cp "build/$TARGET_ID/cve-2026-43499-app.release.so" ../payload-output/cve-2026-43499-app.so
+          cp "build/$TARGET_ID/cve-2026-43499-app.so" ../payload-output/cve-2026-43499-app.debug.so
+          cp "build/$TARGET_ID/cve-2026-43499-root" ../payload-output/
+          cp "src/targets/$TARGET_ID/target.h" ../payload-output/
+          cp "src/targets/$TARGET_ID/p0_fingerprint.h" ../payload-output/
+          sha256sum ../payload-output/* | tee ../payload-output/SHA256SUMS
+          stat -c '%n %s bytes' ../payload-output/* | tee ../payload-output/SIZES.txt
+
+      - name: Upload payload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: tab-s11-${{ inputs.target_id }}-payload
+          path: payload-output/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 9
